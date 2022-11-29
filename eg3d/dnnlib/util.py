@@ -240,6 +240,8 @@ def get_module_from_obj_name(obj_name: str) -> Tuple[types.ModuleType, str]:
     Returns the module and the object name (original name with module part removed)."""
 
     # allow convenience shorthands, substitute them by full names
+    # if  obj_name=='training.dual_discriminator.DualDiscriminator':
+    #     import pdb; pdb.set_trace()
     obj_name = re.sub("^np.", "numpy.", obj_name)
     obj_name = re.sub("^tf.", "tensorflow.", obj_name)
 
@@ -295,6 +297,9 @@ def get_obj_by_name(name: str) -> Any:
 def call_func_by_name(*args, func_name: str = None, **kwargs) -> Any:
     """Finds the python object with the given name and calls it as a function."""
     assert func_name is not None
+    # print('func_name', func_name)
+    # if  func_name=='training.dual_discriminator.DualDiscriminator':
+    #     import pdb; pdb.set_trace()
     func_obj = get_obj_by_name(func_name)
     assert callable(func_obj)
     return func_obj(*args, **kwargs)

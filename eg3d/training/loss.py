@@ -16,7 +16,7 @@ from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import upfirdn2d
 from training.dual_discriminator import filtered_resizing
-
+from torchvision.utils import save_image
 #----------------------------------------------------------------------------
 
 class Loss:
@@ -69,7 +69,7 @@ class StyleGAN2Loss(Loss):
                 ws[:, cutoff:] = self.G.mapping(torch.randn_like(z), c, update_emas=False)[:, cutoff:]
         gen_output = self.G.synthesis(ws, c, neural_rendering_resolution=neural_rendering_resolution, update_emas=update_emas)
         return gen_output, ws
-
+    
     def run_D(self, img, c, blur_sigma=0, blur_sigma_raw=0, update_emas=False):
         blur_size = np.floor(blur_sigma * 3)
         if blur_size > 0:
@@ -87,8 +87,16 @@ class StyleGAN2Loss(Loss):
         logits = self.D(img, c, update_emas=update_emas)
         return logits
 
+    def sym_loss(self, phase, real_img, gen_z, gen_c, G, ):
+        cam_pivot = torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device)
+        cam_radius = G.rendering_kwargs.get('avg_camera_radius', 2.7)
+        cam2world_pose = LookAtPoseSampler.sample(np.pi/2 + angle_y, np.pi/2 + angle_p, cam_pivot, radius=cam_radius, device=device)
+        conditioning_cam2world_pose = LookAtPoseSampler.sample(np.pi/2, np.pi/2, cam_pivot, radius=cam_radius, device=device)
+        camera_params = torch.cat([cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9)], 1)
+        conditioning_params = torch.cat([conditioning_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9)], 1)
+        
     def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg):
-        assert phase in ['Gmain', 'Greg', 'Gboth', 'Dmain', 'Dreg', 'Dboth']
+        assert phase in ['Gmain', 'Greg', 'Gboth', 'Dmain', 'Dreg', 'Dboth','Gsmooth']
         if self.G.rendering_kwargs.get('density_reg', 0) == 0:
             phase = {'Greg': 'none', 'Gboth': 'Gmain'}.get(phase, phase)
         if self.r1_gamma == 0:
@@ -114,8 +122,61 @@ class StyleGAN2Loss(Loss):
                 real_img_raw = upfirdn2d.filter2d(real_img_raw, f / f.sum())
 
         real_img = {'image': real_img, 'image_raw': real_img_raw}
+        # Smothness loss
+        # if phase == 'Greg': import pdb; pdb.set_trace()
+        if phase in ['Gsmooth']:
+            gen_img, _ = self.run_G(gen_z, gen_c, swapping_prob=swapping_prob, neural_rendering_resolution=neural_rendering_resolution)
+            img_r = gen_img['image']
+
+            # img_r= (img_r - img_r.min()) / (img_r.max() - img_r.min())
+            # save_image(img_r, 'test_img/test_loadmd.png')
+            # img = gen_img['image_raw']
+            # depth_map = gen_img['image_depth']
+            # save_image(img, 'test_img/r_test_loadmd.png')
+            # save_image((depth_map - depth_map.min()) / (depth_map.max()-depth_map.min()) , 'test_img/d_test_loadmd.png')
+            # assert False
+            img = gen_img['image_raw']
+            depth_map = gen_img['image_depth']
+            
+            max_depth = depth_map.max()
+            min_depth = depth_map.min()
+            margin = (max_depth + min_depth) / 2.
+            threshold = 0.3
+            variance_c = 0.05
+            mask = (depth_map <  margin).float()
+            list_kernels = []
+            num_neighboors = 3
+            init_neighboor = torch.zeros((num_neighboors, num_neighboors), dtype=torch.float32)
+            init_neighboor[1,1] = 1
+            device=real_img_raw.device
+            for i in range(num_neighboors):
+                for j in range(num_neighboors):
+                    if (i == 1 and j== 1) : continue
+                    tmp = init_neighboor.clone()
+                    tmp[i,j] = -1.
+                    list_kernels.append(tmp)
+            list_kernels = torch.stack(list_kernels, 0).unsqueeze(1)
+            list_kernels.require_grad = False
+            list_kernels = list_kernels.to(device)
+            # img weight
+            
+            diff_img = torch.nn.functional.conv2d(img.view(-1, 1, img.shape[2], img.shape[3] ), list_kernels, padding=(1,1))
+            diff_img = diff_img.view(-1, 3, 8 , img.shape[2], img.shape[3])
+            diff_img = (diff_img **2).sum(1) 
+            threshold_mask = (diff_img < threshold).float()
+            wc = threshold_mask * torch.exp(-diff_img / ( 2* variance_c))
+            
+            # diff depth
+            diff_depth = torch.nn.functional.conv2d(depth_map, list_kernels, padding=(1,1) )
+            neighbor_loss = wc * diff_depth
+            neighbor_loss = mask * (neighbor_loss**2).sum(1)
+            neighbor_loss = neighbor_loss.sum()
+            
+            neighbor_loss.mul(gain).backward()
+
 
         # Gmain: Maximize logits for generated images.
+        
         if phase in ['Gmain', 'Gboth']:
             with torch.autograd.profiler.record_function('Gmain_forward'):
                 gen_img, _gen_ws = self.run_G(gen_z, gen_c, swapping_prob=swapping_prob, neural_rendering_resolution=neural_rendering_resolution)

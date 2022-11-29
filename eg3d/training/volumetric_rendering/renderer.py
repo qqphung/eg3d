@@ -87,7 +87,7 @@ class ImportanceRenderer(torch.nn.Module):
 
     def forward(self, planes, decoder, ray_origins, ray_directions, rendering_options):
         self.plane_axes = self.plane_axes.to(ray_origins.device)
-
+        # import pdb; pdb.set_trace()
         if rendering_options['ray_start'] == rendering_options['ray_end'] == 'auto':
             ray_start, ray_end = math_utils.get_ray_limits_box(ray_origins, ray_directions, box_side_length=rendering_options['box_warp'])
             is_ray_valid = ray_end > ray_start
@@ -115,6 +115,7 @@ class ImportanceRenderer(torch.nn.Module):
         # Fine Pass
         N_importance = rendering_options['depth_resolution_importance']
         if N_importance > 0:
+
             _, _, weights = self.ray_marcher(colors_coarse, densities_coarse, depths_coarse, rendering_options)
 
             depths_fine = self.sample_importance(depths_coarse, weights, N_importance)
@@ -124,6 +125,7 @@ class ImportanceRenderer(torch.nn.Module):
 
             out = self.run_model(planes, decoder, sample_coordinates, sample_directions, rendering_options)
             colors_fine = out['rgb']
+            
             densities_fine = out['sigma']
             colors_fine = colors_fine.reshape(batch_size, num_rays, N_importance, colors_fine.shape[-1])
             densities_fine = densities_fine.reshape(batch_size, num_rays, N_importance, 1)

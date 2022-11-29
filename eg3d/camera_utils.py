@@ -67,6 +67,8 @@ class LookAtPoseSampler:
 
     @staticmethod
     def sample(horizontal_mean, vertical_mean, lookat_position, horizontal_stddev=0, vertical_stddev=0, radius=1, batch_size=1, device='cpu'):
+        import pdb; pdb.set_trace()
+        # np.pi/2 + angle_y, np.pi/2 + angle_p, cam_pivot, radius=cam_radius,
         h = torch.randn((batch_size, 1), device=device) * horizontal_stddev + horizontal_mean
         v = torch.randn((batch_size, 1), device=device) * vertical_stddev + vertical_mean
         v = torch.clamp(v, 1e-5, math.pi - 1e-5)
@@ -83,6 +85,7 @@ class LookAtPoseSampler:
 
         # forward_vectors = math_utils.normalize_vecs(-camera_origins)
         forward_vectors = math_utils.normalize_vecs(lookat_position - camera_origins)
+
         return create_cam2world_matrix(forward_vectors, camera_origins)
 
 class UniformCameraPoseSampler:
@@ -98,6 +101,7 @@ class UniformCameraPoseSampler:
 
     @staticmethod
     def sample(horizontal_mean, vertical_mean, horizontal_stddev=0, vertical_stddev=0, radius=1, batch_size=1, device='cpu'):
+        import pdb; pdb.set_trace()
         h = (torch.rand((batch_size, 1), device=device) * 2 - 1) * horizontal_stddev + horizontal_mean
         v = (torch.rand((batch_size, 1), device=device) * 2 - 1) * vertical_stddev + vertical_mean
         v = torch.clamp(v, 1e-5, math.pi - 1e-5)

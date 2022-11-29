@@ -22,7 +22,7 @@ import tempfile
 import torch
 
 import dnnlib
-from training import training_loop
+from training import training_loop_v2
 from metrics import metric_main
 from torch_utils import training_stats
 from torch_utils import custom_ops
@@ -49,7 +49,7 @@ def subprocess_fn(rank, c, temp_dir):
         custom_ops.verbosity = 'none'
 
     # Execute training loop.
-    training_loop.training_loop(rank=rank, **c)
+    training_loop_v2.training_loop(rank=rank, **c)
 
 #----------------------------------------------------------------------------
 
@@ -106,6 +106,7 @@ def launch_training(c, desc, outdir, dry_run):
 
 def init_dataset_kwargs(data):
     try:
+        
         dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False)
         dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs) # Subclass of training.dataset.Dataset.
         dataset_kwargs.resolution = dataset_obj.resolution # Be explicit about resolution.
@@ -217,6 +218,7 @@ def main(**kwargs):
     """
 
     # Initialize config.
+    
     opts = dnnlib.EasyDict(kwargs) # Command line arguments.
     c = dnnlib.EasyDict() # Main config dict.
     c.G_kwargs = dnnlib.EasyDict(class_name=None, z_dim=512, w_dim=512, mapping_kwargs=dnnlib.EasyDict())
@@ -232,7 +234,7 @@ def main(**kwargs):
         raise click.ClickException('--cond=True requires labels specified in dataset.json')
     c.training_set_kwargs.use_labels = opts.cond
     c.training_set_kwargs.xflip = opts.mirror
-
+    # import pdb; pdb.set_trace()
     # Hyperparameters & settings.
     c.num_gpus = opts.gpus
     c.batch_size = opts.batch
@@ -243,7 +245,7 @@ def main(**kwargs):
     c.D_kwargs.block_kwargs.freeze_layers = opts.freezed
     c.D_kwargs.epilogue_kwargs.mbstd_group_size = opts.mbstd_group
     c.loss_kwargs.r1_gamma = opts.gamma
-    c.G_opt_kwargs.lr = (0.002 if opts.cfg == 'stylegan2' else 0.0025) if opts.glr is None else opts.glr
+    c.G_opt_kwargs.lr = (0.002 if opts.cfg == 'stylegan2' else 0.0005) if opts.glr is None else opts.glr
     c.D_opt_kwargs.lr = opts.dlr
     c.metrics = opts.metrics
     c.total_kimg = opts.kimg
@@ -251,14 +253,14 @@ def main(**kwargs):
     c.image_snapshot_ticks = c.network_snapshot_ticks = opts.snap
     c.random_seed = c.training_set_kwargs.random_seed = opts.seed
     c.data_loader_kwargs.num_workers = opts.workers
-
+    # import pdb; pdb.set_trace()
     # Sanity checks.
     if c.batch_size % c.num_gpus != 0:
         raise click.ClickException('--batch must be a multiple of --gpus')
     if c.batch_size % (c.num_gpus * c.batch_gpu) != 0:
         raise click.ClickException('--batch must be a multiple of --gpus times --batch-gpu')
-    if c.batch_gpu < c.D_kwargs.epilogue_kwargs.mbstd_group_size:
-        raise click.ClickException('--batch-gpu cannot be smaller than --mbstd')
+    # if c.batch_gpu < c.D_kwargs.epilogue_kwargs.mbstd_group_size:
+    #     raise click.ClickException('--batch-gpu cannot be smaller than --mbstd')
     if any(not metric_main.is_valid_metric(metric) for metric in c.metrics):
         raise click.ClickException('\n'.join(['--metrics can only contain the following values:'] + metric_main.list_valid_metrics()))
 
@@ -269,7 +271,7 @@ def main(**kwargs):
     c.G_kwargs.fused_modconv_default = 'inference_only' # Speed up training by using regular convolutions instead of grouped convolutions.
     c.loss_kwargs.filter_mode = 'antialiased' # Filter mode for raw images ['antialiased', 'none', float [0-1]]
     c.D_kwargs.disc_c_noise = opts.disc_c_noise # Regularization for discriminator pose conditioning
-
+    # c.training_set_kwargs.resolution = 128
     if c.training_set_kwargs.resolution == 512:
         sr_module = 'training.superresolution.SuperresolutionHybrid8XDC'
     elif c.training_set_kwargs.resolution == 256:
