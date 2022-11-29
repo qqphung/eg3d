@@ -130,6 +130,8 @@ def training_loop(
     start_time = time.time()
     device = torch.device('cuda', rank)
     np.random.seed(random_seed * num_gpus + rank)
+    torch.cuda.set_device(device)
+    torch.cuda.empty_cache()
     torch.manual_seed(random_seed * num_gpus + rank)
     torch.backends.cudnn.benchmark = cudnn_benchmark    # Improves training speed.
     torch.backends.cuda.matmul.allow_tf32 = False       # Improves numerical accuracy.
@@ -294,7 +296,7 @@ def training_loop(
 
             for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
                 loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
-            # phase.module.requires_grad_(False)
+            phase.module.requires_grad_(False)
 
             # Update weights.
             with torch.autograd.profiler.record_function(phase.name + '_opt'):

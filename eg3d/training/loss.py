@@ -16,7 +16,7 @@ from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import upfirdn2d
 from training.dual_discriminator import filtered_resizing
-from torchvision.utils import save_image
+#from torchvision.utils import save_image
 #----------------------------------------------------------------------------
 
 class Loss:
@@ -160,8 +160,8 @@ class StyleGAN2Loss(Loss):
             list_kernels = list_kernels.to(device)
             # img weight
             
-            diff_img = torch.nn.functional.conv2d(img.view(-1, 1, img.shape[2], img.shape[3] ), list_kernels, padding=(1,1))
-            diff_img = diff_img.view(-1, 3, 8 , img.shape[2], img.shape[3])
+            diff_img = torch.nn.functional.conv2d(img.reshape(-1, 1, img.shape[2], img.shape[3] ), list_kernels, padding=(1,1))
+            diff_img = diff_img.reshape(-1, 3, 8 , img.shape[2], img.shape[3])
             diff_img = (diff_img **2).sum(1) 
             threshold_mask = (diff_img < threshold).float()
             wc = threshold_mask * torch.exp(-diff_img / ( 2* variance_c))
