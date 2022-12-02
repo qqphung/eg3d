@@ -44,6 +44,7 @@ def main(args):
     setup_seed(seed=cfg.seed, cuda_deterministic=False)
 
     torch.cuda.set_device(args.local_rank)
+    torch.cuda.empty_cache()
 
     os.makedirs(cfg.output, exist_ok=True)
     init_logging(rank, cfg.output)
