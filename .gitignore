@@ -35,3 +35,4 @@ test_img/
 *.png
 eg3d/backup/*
 eg3d/~/*
+*.pt

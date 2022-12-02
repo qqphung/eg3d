@@ -1,15 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2021-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
-"""Generate images and shapes using pretrained network pickle."""
-
 import os
 import re
 from typing import List, Optional, Tuple, Union
@@ -33,7 +21,6 @@ from training.triplane import TriPlaneGenerator
 
 def parse_range(s: Union[str, List]) -> List[int]:
     '''Parse a comma separated list of numbers or ranges and return a list of ints.
-
     Example: '1,2,5-10' returns [1, 2, 5, 6, 7]
     '''
     if isinstance(s, list): return s
@@ -50,7 +37,6 @@ def parse_range(s: Union[str, List]) -> List[int]:
 
 def parse_vec2(s: Union[str, Tuple[float, float]]) -> Tuple[float, float]:
     '''Parse a floating point 2-vector of syntax 'a,b'.
-
     Example:
         '0,1' returns (0,1)
     '''
@@ -110,10 +96,10 @@ def create_samples(N=256, voxel_origin=[0, 0, 0], cube_length=2.0):
 @click.option('--class', 'class_idx', type=int, help='Class label (unconditional if not specified)')
 @click.option('--outdir', help='Where to save the output images', type=str, required=True, metavar='DIR')
 @click.option('--shapes', help='Export shapes as .mrc files viewable in ChimeraX', type=bool, required=False, metavar='BOOL', default=False, show_default=True)
-@click.option('--shape-res', help='', type=int, required=False, metavar='int', default=64, show_default=True)
+@click.option('--shape-res', help='', type=int, required=False, metavar='int', default=512, show_default=True)
 @click.option('--fov-deg', help='Field of View of camera in degrees', type=int, required=False, metavar='float', default=18.837, show_default=True)
 @click.option('--shape-format', help='Shape Format', type=click.Choice(['.mrc', '.ply']), default='.mrc')
-@click.option('--reload_modules', help='Overload persistent modules?', type=bool, required=False, metavar='BOOL', default=True, show_default=True)
+@click.option('--reload_modules', help='Overload persistent modules?', type=bool, required=False, metavar='BOOL', default=False, show_default=True)
 def generate_images(
     network_pkl: str,
     seeds: List[int],
@@ -128,9 +114,7 @@ def generate_images(
     reload_modules: bool,
 ):
     """Generate images using pretrained network pickle.
-
     Examples:
-
     \b
     # Generate an image using pre-trained FFHQ model.
     python gen_samples.py --outdir=output --trunc=0.7 --seeds=0-5 --shapes=True\\
@@ -170,64 +154,17 @@ def generate_images(
             conditioning_cam2world_pose = LookAtPoseSampler.sample(np.pi/2, np.pi/2, cam_pivot, radius=cam_radius, device=device)
             camera_params = torch.cat([cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9)], 1)
             conditioning_params = torch.cat([conditioning_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9)], 1)
-            
+
             ws = G.mapping(z, conditioning_params, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
-            img = G.synthesis(ws, camera_params)
-            
-            gen_img = img.copy()
+            img = G.synthesis(ws, camera_params)['image']
 
-            # gen_img, _ = self.run_G(gen_z, gen_c, swapping_prob=swapping_prob, neural_rendering_resolution=neural_rendering_resolution)
-            img_r = gen_img['image']
-            img = gen_img['image_raw']
-            depth_map = gen_img['image_depth']
-            # import pdb; pdb.set_trace()
-            max_depth = depth_map.max()
-            min_depth = depth_map.min()
-            margin = (max_depth + min_depth) / 2.
-            threshold = 0.3
-            variance_c = 0.05
-            mask = (depth_map <  margin).float()
-            list_kernels = []
-            num_neighboors = 3
-            init_neighboor = torch.zeros((num_neighboors, num_neighboors), dtype=torch.float32)
-            init_neighboor[1,1] = 1
-            # device=real_img_raw.device
-            for i in range(num_neighboors):
-                for j in range(num_neighboors):
-                    if (i == 1 and j== 1) : continue
-                    tmp = init_neighboor.clone()
-                    tmp[i,j] = -1.
-                    list_kernels.append(tmp)
-            list_kernels = torch.stack(list_kernels, 0).unsqueeze(1)
-            list_kernels.require_grad = False
-            list_kernels = list_kernels.to(device)
-            # img weight
-            
-            diff_img = torch.nn.functional.conv2d(img.view(-1, 1, img.shape[2], img.shape[3] ), list_kernels, padding=(1,1))
-            diff_img = diff_img.view(-1, 3, 8 , img.shape[2], img.shape[3])
-            diff_img = (diff_img **2).sum(1) 
-            threshold_mask = (diff_img < threshold).float()
-            wc = threshold_mask * torch.exp(-diff_img / ( 2* variance_c))
-            
-            # diff depth
-            diff_depth = torch.nn.functional.conv2d(depth_map, list_kernels, padding=(1,1) )
-            neighbor_loss = wc * diff_depth
-            neighbor_loss = mask * (neighbor_loss **2).sum(1)
-            neighbor_loss = neighbor_loss.mean()'''
-           
-            # neighbor_loss.mul(gain).backward()
-
-
-            
-            
             img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
-            PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save('test_img' + str(angle_y) + '_' + str(angle_p)+ '.png')
             imgs.append(img)
 
         img = torch.cat(imgs, dim=2)
 
         PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
-        
+
         if shapes:
             # extract a shape.mrc with marching cubes. You can view the .mrc file using ChimeraX from UCSF.
             max_batch=1000000
@@ -237,7 +174,7 @@ def generate_images(
             sigmas = torch.zeros((samples.shape[0], samples.shape[1], 1), device=z.device)
             transformed_ray_directions_expanded = torch.zeros((samples.shape[0], max_batch, 3), device=z.device)
             transformed_ray_directions_expanded[..., -1] = -1
-            
+
             head = 0
             with tqdm(total = samples.shape[1]) as pbar:
                 with torch.no_grad():
@@ -250,7 +187,7 @@ def generate_images(
 
             sigmas = sigmas.reshape((shape_res, shape_res, shape_res)).cpu().numpy()
             sigmas = np.flip(sigmas, 0)
-            import pdb; pdb.set_trace()
+
             # Trim the border of the extracted cube
             pad = int(30 * shape_res / 256)
             pad_value = -1000
@@ -273,5 +210,3 @@ def generate_images(
 
 if __name__ == "__main__":
     generate_images() # pylint: disable=no-value-for-parameter
-
-#----------------------------------------------------------------------------

@@ -245,8 +245,11 @@ def main(**kwargs):
     c.D_kwargs.block_kwargs.freeze_layers = opts.freezed
     c.D_kwargs.epilogue_kwargs.mbstd_group_size = opts.mbstd_group
     c.loss_kwargs.r1_gamma = opts.gamma
-    c.G_opt_kwargs.lr = (0.002 if opts.cfg == 'stylegan2' else 0.0005) if opts.glr is None else opts.glr
-    c.D_opt_kwargs.lr = opts.dlr
+    c.G_opt_kwargs.lr = (0.002 if opts.cfg == 'stylegan2' else 0.001) if opts.glr is None else opts.glr
+    print('lr-----------G', c.G_opt_kwargs.lr )
+    c.D_opt_kwargs.lr = 0.001 #ßopts.dlr
+    print('lr--------------D', c.D_opt_kwargs.lr)
+    
     c.metrics = opts.metrics
     c.total_kimg = opts.kimg
     c.kimg_per_tick = opts.tick
@@ -335,7 +338,7 @@ def main(**kwargs):
         assert False, "Need to specify config"
 
 
-
+    
     if opts.density_reg > 0:
         c.G_reg_interval = opts.density_reg_every
     c.G_kwargs.rendering_kwargs = rendering_options

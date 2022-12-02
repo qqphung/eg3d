@@ -173,6 +173,7 @@ class ImportanceRenderer(torch.nn.Module):
         Return depths of approximately uniformly spaced samples along rays.
         """
         N, M, _ = ray_origins.shape
+        
         if disparity_space_sampling:
             depths_coarse = torch.linspace(0,
                                     1,
