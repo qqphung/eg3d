@@ -17,6 +17,9 @@ from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import upfirdn2d
 from training.dual_discriminator import filtered_resizing
 from torchvision.utils import save_image
+import os
+import cv2
+from .face_parser import FaceParser
 #----------------------------------------------------------------------------
 
 class Loss:
@@ -53,14 +56,19 @@ class StyleGAN2Loss(Loss):
         self.resample_filter = upfirdn2d.setup_filter([1,3,3,1], device=device)
         self.blur_raw_target = True
         assert self.gpc_reg_prob is None or (0 <= self.gpc_reg_prob <= 1)
+        self.step = 0
+        self.face_parser = FaceParser()
 
     def run_G(self, z, c, swapping_prob, neural_rendering_resolution, update_emas=False):
+        # import pdb; pdb.set_trace()
+        # self.G.eval().requires_grad_(False)
         if swapping_prob is not None:
             c_swapped = torch.roll(c.clone(), 1, 0)
             c_gen_conditioning = torch.where(torch.rand((c.shape[0], 1), device=c.device) < swapping_prob, c_swapped, c)
         else:
             c_gen_conditioning = torch.zeros_like(c)
-
+        
+        c_gen_conditioning = torch.zeros_like(c)
         ws = self.G.mapping(z, c_gen_conditioning, update_emas=update_emas)
         if self.style_mixing_prob > 0:
             with torch.autograd.profiler.record_function('style_mixing'):
@@ -68,8 +76,77 @@ class StyleGAN2Loss(Loss):
                 cutoff = torch.where(torch.rand([], device=ws.device) < self.style_mixing_prob, cutoff, torch.full_like(cutoff, ws.shape[1]))
                 ws[:, cutoff:] = self.G.mapping(torch.randn_like(z), c, update_emas=False)[:, cutoff:]
         gen_output = self.G.synthesis(ws, c, neural_rendering_resolution=neural_rendering_resolution, update_emas=update_emas)
+        '''self.step += 1
+        run_dir = 'test_img/save'
+        images =gen_output['image']
+        images= (images - images.min()) / (images.max() - images.min())
+        images_raw = gen_output['image_raw']
+        images_raw= (images_raw - images_raw.min()) / (images_raw.max() - images_raw.min())
+        images_depth = gen_output['image_depth']
+        images_depth= (images_depth - images_depth.min()) / (images_depth.max() - images_depth.min())
+        save_image(images, os.path.join(run_dir, f'fakes{self.step}.png'))
+        save_image(images_raw, os.path.join(run_dir, f'fakes{self.step}_raw.png') )
+        save_image(images_depth, os.path.join(run_dir, f'fakes{self.step}_depth.png'))
+        torch.save(z,os.path.join(run_dir, f'z{self.step}.pt') )
+        torch.save(c_gen_conditioning ,os.path.join(run_dir, f'c{self.step}.pt') )
+        # assert False'''
         return gen_output, ws
-    
+    def smooth_seg_loss(self,depth_map, mask, img, device):
+        mask.require_grad = False
+        mask.require_grad = False
+        list_kernels = []
+        num_neighboors = 3
+        init_neighboor = torch.zeros((num_neighboors, num_neighboors), dtype=torch.float32)
+        init_neighboor[1,1] = 1
+        
+        for i in range(num_neighboors):
+            for j in range(num_neighboors):
+                if (i == 1 and j== 1) : continue
+                tmp = init_neighboor.clone()
+                tmp[i,j] = -1.
+                list_kernels.append(tmp)
+        list_kernels = torch.stack(list_kernels, 0).unsqueeze(1)
+        list_kernels.require_grad = False
+        list_kernels = list_kernels.to(device)
+        
+        # diff depth
+        diff_depth = torch.nn.functional.conv2d(depth_map, list_kernels, padding=(1,1) )
+        mask[:, :, 0] = 0
+        mask[:, :, 255] = 0
+        mask[:, :, :, 255] = 0
+        mask[:, :, :, 0] = 0
+        neighbor_loss = mask *((diff_depth**2).sum(1)) ** 0.5
+        save_image((neighbor_loss - neighbor_loss.min()) / (neighbor_loss.max()-neighbor_loss.min()) , 'test_img/ne_test_loadmd.png')
+        neighbor_loss = neighbor_loss.mean()
+        return neighbor_loss
+
+    def load_cz(self, swapping_prob, device):
+        dir = 'save_test'
+        seg_dir  = '../seg_mask'
+        for i in range(1,11):
+            path_c = os.path.join(dir, 'c'+str(i)+'.pt')
+            c = torch.load(path_c)
+            path_z = os.path.join( dir, 'z'+str(i)+'.pt')
+            z = torch.load(path_z)
+            out, _ = self.run_G(z, c, swapping_prob=swapping_prob, neural_rendering_resolution=128)
+
+            # FACE PARSING
+            image = out["image"].permute(0,2,3,1).detach().cpu().numpy()[0]
+            image = (image - image.min((0, 1))) / (image.max((0, 1)) - image.min((0, 1)))
+            image = (image * 255).astype('uint8')
+            seg_mask = self.face_parser.parse(image)
+            seg_mask = cv2.resize(seg_mask, (256, 256), cv2.INTER_NEAREST)
+
+            seg_mask = (seg_mask == 1).astype(np.uint8)
+            kernel = np.ones((7, 7), np.uint8)
+            seg_mask = cv2.erode(seg_mask, kernel)
+            seg_mask = torch.tensor(seg_mask).unsqueeze(0).unsqueeze(0).to(device)
+            depth_map = out['image_depth']
+            
+            resize_d = cv2.resize(depth_map[0,0].cpu().detach().numpy(), (256, 256), cv2.INTER_NEAREST)
+            resize_d = torch.tensor(resize_d).unsqueeze(0).unsqueeze(0).to(device)
+            neighbor_loss = self.smooth_seg_loss(resize_d, seg_mask, out['image_raw'].to(device), device)
+
     def run_D(self, img, c, blur_sigma=0, blur_sigma_raw=0, update_emas=False):
         blur_size = np.floor(blur_sigma * 3)
         if blur_size > 0:
@@ -87,7 +164,8 @@ class StyleGAN2Loss(Loss):
         logits = self.D(img, c, update_emas=update_emas)
         return logits
 
-    def sym_loss(self, phase, real_img, gen_z, gen_c, G, ):
+    def sym_loss(self, phase, real_img, gen_z, gen_c ):
+        G = phase
         cam_pivot = torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device)
         cam_radius = G.rendering_kwargs.get('avg_camera_radius', 2.7)
         cam2world_pose = LookAtPoseSampler.sample(np.pi/2 + angle_y, np.pi/2 + angle_p, cam_pivot, radius=cam_radius, device=device)
@@ -122,62 +200,80 @@ class StyleGAN2Loss(Loss):
                 real_img_raw = upfirdn2d.filter2d(real_img_raw, f / f.sum())
 
         real_img = {'image': real_img, 'image_raw': real_img_raw}
+        gen_img, _ = self.run_G(gen_z, gen_c, swapping_prob=swapping_prob, neural_rendering_resolution=64)
+
         # Smothness loss
         # if phase == 'Greg': import pdb; pdb.set_trace()
         if phase in ['Gsmooth']:
-            gen_img, _ = self.run_G(gen_z, gen_c, swapping_prob=swapping_prob, neural_rendering_resolution=neural_rendering_resolution)
-            img_r = gen_img['image']
 
+        # if :
+            loss = self.load_cz(swapping_prob, real_img_raw.device)
+            loss.mul(gain).backward()
+            # gen_img, _ = self.run_G(gen_z, gen_c, swapping_prob=swapping_prob, neural_rendering_resolution=128)
+            # img_r = gen_img['image']
+
+            
+            # img = gen_img['image_raw']
+            # depth_map = gen_img['image_depth']
+            
+            # max_depth = depth_map.max()
+            # min_depth = depth_map.min()
+            # margin = (max_depth + min_depth) / 2.05
+            # threshold = 0.3
+            # variance_c = 0.05
+            # mask = (depth_map <  margin).float()
+            # list_kernels = []
+            # num_neighboors = 3
+            # init_neighboor = torch.zeros((num_neighboors, num_neighboors), dtype=torch.float32)
+            # init_neighboor[1,1] = 1
+            # device=real_img_raw.device
+            # for i in range(num_neighboors):
+            #     for j in range(num_neighboors):
+            #         if (i == 1 and j== 1) : continue
+            #         tmp = init_neighboor.clone()
+            #         tmp[i,j] = -1.
+            #         list_kernels.append(tmp)
+            # list_kernels = torch.stack(list_kernels, 0).unsqueeze(1)
+            # list_kernels.require_grad = False
+            # list_kernels = list_kernels.to(device)
+            # # img weight
+            
+            # diff_img = torch.nn.functional.conv2d(img.view(-1, 1, img.shape[2], img.shape[3] ), list_kernels, padding=(1,1))
+            # diff_img = diff_img.view(-1, 3, 8 , img.shape[2], img.shape[3])
+            # diff_img = (diff_img **2).sum(1) 
+            # threshold_mask = (diff_img < threshold).float()
+            # wc = threshold_mask * torch.exp(-diff_img / ( 2* variance_c))
+            
+            # # diff depth
+            # diff_depth = torch.nn.functional.conv2d(depth_map, list_kernels, padding=(1,1) )
+            # neighbor_loss = wc * diff_depth
+            # mask[:, :, 0] = 0
+            # mask[:, :, 127] = 0
+            # mask[:, :, :, 127] = 0
+            # mask[:, :, :, 0] = 0
+            # neighbor_loss = mask *((neighbor_loss**2).sum(1)) ** 0.5
+            # save_image((neighbor_loss - neighbor_loss.min()) / (neighbor_loss.max()-neighbor_loss.min()) , 'test_img/ne_test_loadmd.png')
+            # neighbor_loss = neighbor_loss.mean()
+            # (neighbor_loss.mul(gain)  ).backward()
+            # import pdb; pdb.set_trace()
+            
             # img_r= (img_r - img_r.min()) / (img_r.max() - img_r.min())
             # save_image(img_r, 'test_img/test_loadmd.png')
             # img = gen_img['image_raw']
             # depth_map = gen_img['image_depth']
             # save_image(img, 'test_img/r_test_loadmd.png')
             # save_image((depth_map - depth_map.min()) / (depth_map.max()-depth_map.min()) , 'test_img/d_test_loadmd.png')
-            # assert False
-            img = gen_img['image_raw']
-            depth_map = gen_img['image_depth']
+            # save_image((wc[0,1] - wc[0,1].min()) / (wc[0,1].max()-wc[0,1].min()) , 'test_img/wc_test_loadmd1.png')
             
-            max_depth = depth_map.max()
-            min_depth = depth_map.min()
-            margin = (max_depth + min_depth) / 2.
-            threshold = 0.3
-            variance_c = 0.05
-            mask = (depth_map <  margin).float()
-            list_kernels = []
-            num_neighboors = 3
-            init_neighboor = torch.zeros((num_neighboors, num_neighboors), dtype=torch.float32)
-            init_neighboor[1,1] = 1
-            device=real_img_raw.device
-            for i in range(num_neighboors):
-                for j in range(num_neighboors):
-                    if (i == 1 and j== 1) : continue
-                    tmp = init_neighboor.clone()
-                    tmp[i,j] = -1.
-                    list_kernels.append(tmp)
-            list_kernels = torch.stack(list_kernels, 0).unsqueeze(1)
-            list_kernels.require_grad = False
-            list_kernels = list_kernels.to(device)
-            # img weight
-            
-            diff_img = torch.nn.functional.conv2d(img.view(-1, 1, img.shape[2], img.shape[3] ), list_kernels, padding=(1,1))
-            diff_img = diff_img.view(-1, 3, 8 , img.shape[2], img.shape[3])
-            diff_img = (diff_img **2).sum(1) 
-            threshold_mask = (diff_img < threshold).float()
-            wc = threshold_mask * torch.exp(-diff_img / ( 2* variance_c))
-            
-            # diff depth
-            diff_depth = torch.nn.functional.conv2d(depth_map, list_kernels, padding=(1,1) )
-            neighbor_loss = wc * diff_depth
-            neighbor_loss = mask * (neighbor_loss**2).sum(1)
-            neighbor_loss = neighbor_loss.sum()
-            
-            neighbor_loss.mul(gain).backward()
+            # save_image((hh - hh.min()) / (hh.max()-hh.min()) , 'test_img/hh.png')
+            # save_image((kk[0,1] - kk[0,1].min()) / (kk[0,1].max()-kk[0,1].min()) , 'test_img/hh1.png')
+            # return gen_img
 
 
         # Gmain: Maximize logits for generated images.
         
         if phase in ['Gmain', 'Gboth']:
+        # if True:
             with torch.autograd.profiler.record_function('Gmain_forward'):
                 gen_img, _gen_ws = self.run_G(gen_z, gen_c, swapping_prob=swapping_prob, neural_rendering_resolution=neural_rendering_resolution)
                 gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma)
@@ -187,9 +283,12 @@ class StyleGAN2Loss(Loss):
                 training_stats.report('Loss/G/loss', loss_Gmain)
             with torch.autograd.profiler.record_function('Gmain_backward'):
                 loss_Gmain.mean().mul(gain).backward()
+                # return gen_img
 
         # Density Regularization
         if phase in ['Greg', 'Gboth'] and self.G.rendering_kwargs.get('density_reg', 0) > 0 and self.G.rendering_kwargs['reg_type'] == 'l1':
+        # if True:
+            
             if swapping_prob is not None:
                 c_swapped = torch.roll(gen_c.clone(), 1, 0)
                 c_gen_conditioning = torch.where(torch.rand([], device=gen_c.device) < swapping_prob, c_swapped, gen_c)
@@ -210,10 +309,14 @@ class StyleGAN2Loss(Loss):
             sigma_perturbed = sigma[:, sigma.shape[1]//2:]
 
             TVloss = torch.nn.functional.l1_loss(sigma_initial, sigma_perturbed) * self.G.rendering_kwargs['density_reg']
+            
             TVloss.mul(gain).backward()
 
+
+        
         # Alternative density regularization
         if phase in ['Greg', 'Gboth'] and self.G.rendering_kwargs.get('density_reg', 0) > 0 and self.G.rendering_kwargs['reg_type'] == 'monotonic-detach':
+        # if True:   
             if swapping_prob is not None:
                 c_swapped = torch.roll(gen_c.clone(), 1, 0)
                 c_gen_conditioning = torch.where(torch.rand([], device=gen_c.device) < swapping_prob, c_swapped, gen_c)
