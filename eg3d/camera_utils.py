@@ -67,7 +67,7 @@ class LookAtPoseSampler:
 
     @staticmethod
     def sample(horizontal_mean, vertical_mean, lookat_position, horizontal_stddev=0, vertical_stddev=0, radius=1, batch_size=1, device='cpu'):
-        import pdb; pdb.set_trace()
+        
         # np.pi/2 + angle_y, np.pi/2 + angle_p, cam_pivot, radius=cam_radius,
         h = torch.randn((batch_size, 1), device=device) * horizontal_stddev + horizontal_mean
         v = torch.randn((batch_size, 1), device=device) * vertical_stddev + vertical_mean

@@ -29,11 +29,13 @@ import legacy
 from metrics import metric_main
 from camera_utils import LookAtPoseSampler
 from training.crosssection_utils import sample_cross_section
-
+from torchvision.utils import save_image
 #----------------------------------------------------------------------------
 
 def setup_snapshot_image_grid(training_set, random_seed=0):
     rnd = np.random.RandomState(random_seed)
+    # gw = np.clip(2,2,2)
+    # gh = np.clip(2,2,2)
     gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
     gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
 
@@ -204,7 +206,8 @@ def training_loop(
         print('Setting up training phases...')
     loss = dnnlib.util.construct_class_by_name(device=device, G=G, D=D, augment_pipe=augment_pipe, **loss_kwargs) # subclass of training.loss.Loss
     phases = []
-    for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval)]:
+    # for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval)]:
+    for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]:
         if reg_interval is None:
             # TODO: Put parameters need to be trained
             opt = dnnlib.util.construct_class_by_name(params=module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
@@ -216,9 +219,12 @@ def training_loop(
             opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
             # TODO: Put parameters need to be trained
             opt = dnnlib.util.construct_class_by_name(module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
+            
             phases += [dnnlib.EasyDict(name=name+'main', module=module, opt=opt, interval=1)]
             phases += [dnnlib.EasyDict(name=name+'reg', module=module, opt=opt, interval=reg_interval)]
-            phases += [dnnlib.EasyDict(name=name+'smooth', module=module, opt=opt, interval=1)]
+            if name == 'G':
+                phases += [dnnlib.EasyDict(name=name+'smooth', module=module, opt=opt, interval=reg_interval)]
+            
     for phase in phases:
         phase.start_event = None
         phase.end_event = None
@@ -236,6 +242,8 @@ def training_loop(
         save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
         grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
         grid_c = torch.from_numpy(labels).to(device).split(batch_gpu)
+        # import pdb; pdb.set_trace()
+        
 
     # Initialize logs.
     if rank == 0:
@@ -264,6 +272,18 @@ def training_loop(
     batch_idx = 0
     if progress_fn is not None:
         progress_fn(0, total_kimg)
+
+    out = G_ema(z=grid_z[0], c=grid_c[0], noise_mode='const') 
+    images =out['image']
+    images= (images - images.min()) / (images.max() - images.min())
+    images_raw = out['image_raw']
+    images_raw= (images_raw - images_raw.min()) / (images_raw.max() - images_raw.min())
+    images_depth = out['image_depth']
+    images_depth= (images_depth - images_depth.min()) / (images_depth.max() - images_depth.min())
+    save_image(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_origin.png'))
+    save_image(images_raw, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_origin_raw.png') )
+    save_image(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_origin_depth.png'))
+    i = 0
     while True:
 
         # Fetch training data.
@@ -280,19 +300,27 @@ def training_loop(
         # Execute training phases.
         
         for phase, phase_gen_z, phase_gen_c in zip(phases, all_gen_z, all_gen_c):
+            '''for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
+                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
+            continue'''
+
             if batch_idx % phase.interval != 0:
                 continue
             if phase.start_event is not None:
                 phase.start_event.record(torch.cuda.current_stream(device))
 
-            # Accumulate gradients.
             phase.opt.zero_grad(set_to_none=True)
-            phase.module.backbone.mapping.requires_grad_(False)
-            phase.module.backbone.synthesis.requires_grad_(True)
-            phase.module.ray_sampler.requires_grad_(True)
-            phase.module.superresolution.requires_grad_(True)
-            phase.module.decoder.requires_grad_(False)
-            phase.module.renderer.requires_grad_(True)
+            # Accumulate gradients.
+            if phase.name.startswith('G'):
+                
+                phase.module.backbone.mapping.requires_grad_(True)
+                phase.module.backbone.synthesis.requires_grad_(True)
+                phase.module.ray_sampler.requires_grad_(True)
+                phase.module.superresolution.requires_grad_(True)
+                phase.module.decoder.requires_grad_(True)
+                phase.module.renderer.requires_grad_(True)
+            else:
+                phase.module.requires_grad_(True)
 
             for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
                 loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
@@ -311,11 +339,25 @@ def training_loop(
                     for param, grad in zip(params, grads):
                         param.grad = grad.reshape(param.shape)
                 phase.opt.step()
-
+            # import pdb; pdb.set_trace()
+            if (i % 100 == 0):
+                out = G(z=grid_z[0], c=grid_c[0], noise_mode='const') 
+                images =out['image']
+                images= (images - images.min()) / (images.max() - images.min())
+                images_raw = out['image_raw']
+                images_raw= (images_raw - images_raw.min()) / (images_raw.max() - images_raw.min())
+                images_depth = out['image_depth']
+                images_depth= (images_depth - images_depth.min()) / (images_depth.max() - images_depth.min())
+                save_image(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{phase.name}_{i}.png'))
+                save_image(images_raw, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{phase.name}_{i}_raw.png') )
+                save_image(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{phase.name}_{i}_depth.png'))
+            
             # Phase done.
             if phase.end_event is not None:
                 phase.end_event.record(torch.cuda.current_stream(device))
-
+        i += 1
+        
+            
         # Update G_ema.
         with torch.autograd.profiler.record_function('Gema'):
             ema_nimg = ema_kimg * 1000
@@ -328,6 +370,19 @@ def training_loop(
                 b_ema.copy_(b)
             G_ema.neural_rendering_resolution = G.neural_rendering_resolution
             G_ema.rendering_kwargs = G.rendering_kwargs.copy()
+        
+        # visual after each update loss
+        
+        out = G_ema(z=grid_z[0], c=grid_c[0], noise_mode='const') 
+        images =out['image']
+        images= (images - images.min()) / (images.max() - images.min())
+        images_raw = out['image_raw']
+        images_raw= (images_raw - images_raw.min()) / (images_raw.max() - images_raw.min())
+        images_depth = out['image_depth']
+        images_depth= (images_depth - images_depth.min()) / (images_depth.max() - images_depth.min())
+        save_image(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{phase.name}_ema.png'))
+        save_image(images_raw, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{phase.name}_ema_raw.png') )
+        save_image(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{phase.name}_ema_depth.png'))
 
         # Update state.
         cur_nimg += batch_size
@@ -371,14 +426,16 @@ def training_loop(
                 print('Aborting...')
 
         # Save image snapshot.
-        if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
-            out = [G_ema(z=z, c=c, noise_mode='const') for z, c in zip(grid_z, grid_c)]
-            images = torch.cat([o['image'].cpu() for o in out]).numpy()
-            images_raw = torch.cat([o['image_raw'].cpu() for o in out]).numpy()
-            images_depth = -torch.cat([o['image_depth'].cpu() for o in out]).numpy()
-            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
-            save_image_grid(images_raw, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_raw.png'), drange=[-1,1], grid_size=grid_size)
-            save_image_grid(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_depth.png'), drange=[images_depth.min(), images_depth.max()], grid_size=grid_size)
+        # if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
+        #     grid_z = torch.randn([2, G.z_dim], device=device).split(batch_gpu)
+        #     grid_c = torch.from_numpy(labels[2]).to(device).split(batch_gpu)
+        #     out = [G_ema(z=z, c=c, noise_mode='const') for z, c in zip(grid_z, grid_c)]
+        #     images = torch.cat([o['image'].cpu() for o in out]).numpy()
+        #     images_raw = torch.cat([o['image_raw'].cpu() for o in out]).numpy()
+        #     images_depth = -torch.cat([o['image_depth'].cpu() for o in out]).numpy()
+        #     save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
+        #     save_image_grid(images_raw, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_raw.png'), drange=[-1,1], grid_size=grid_size)
+        #     save_image_grid(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_depth.png'), drange=[images_depth.min(), images_depth.max()], grid_size=grid_size)
             
             #--------------------
             # # Log forward-conditioned images
@@ -423,7 +480,8 @@ def training_loop(
                     pickle.dump(snapshot_data, f)
 
         # Evaluate metrics.
-        if (snapshot_data is not None) and (len(metrics) > 0):
+        # if (snapshot_data is not None) and (len(metrics) > 0) :
+        if False:
             if rank == 0:
                 print(run_dir)
                 print('Evaluating metrics...')
@@ -436,7 +494,7 @@ def training_loop(
         del snapshot_data # conserve memory
 
         # Collect statistics.
-        for phase in phases:
+        '''for phase in phases:
             value = []
             if (phase.start_event is not None) and (phase.end_event is not None):
                 phase.end_event.synchronize()
@@ -473,6 +531,6 @@ def training_loop(
     # Done.
     if rank == 0:
         print()
-        print('Exiting...')
+        print('Exiting...')'''
 
 #----------------------------------------------------------------------------

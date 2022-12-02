@@ -110,7 +110,7 @@ def create_samples(N=256, voxel_origin=[0, 0, 0], cube_length=2.0):
 @click.option('--class', 'class_idx', type=int, help='Class label (unconditional if not specified)')
 @click.option('--outdir', help='Where to save the output images', type=str, required=True, metavar='DIR')
 @click.option('--shapes', help='Export shapes as .mrc files viewable in ChimeraX', type=bool, required=False, metavar='BOOL', default=False, show_default=True)
-@click.option('--shape-res', help='', type=int, required=False, metavar='int', default=512, show_default=True)
+@click.option('--shape-res', help='', type=int, required=False, metavar='int', default=64, show_default=True)
 @click.option('--fov-deg', help='Field of View of camera in degrees', type=int, required=False, metavar='float', default=18.837, show_default=True)
 @click.option('--shape-format', help='Shape Format', type=click.Choice(['.mrc', '.ply']), default='.mrc')
 @click.option('--reload_modules', help='Overload persistent modules?', type=bool, required=False, metavar='BOOL', default=True, show_default=True)
@@ -173,6 +173,7 @@ def generate_images(
             
             ws = G.mapping(z, conditioning_params, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
             img = G.synthesis(ws, camera_params)
+            
             gen_img = img.copy()
 
             # gen_img, _ = self.run_G(gen_z, gen_c, swapping_prob=swapping_prob, neural_rendering_resolution=neural_rendering_resolution)
@@ -212,8 +213,8 @@ def generate_images(
             diff_depth = torch.nn.functional.conv2d(depth_map, list_kernels, padding=(1,1) )
             neighbor_loss = wc * diff_depth
             neighbor_loss = mask * (neighbor_loss **2).sum(1)
-            neighbor_loss = neighbor_loss.mean()
-            import pdb; pdb.set_trace()
+            neighbor_loss = neighbor_loss.mean()'''
+           
             # neighbor_loss.mul(gain).backward()
 
 
@@ -226,7 +227,7 @@ def generate_images(
         img = torch.cat(imgs, dim=2)
 
         PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
-        import pdb; pdb.set_trace()
+        
         if shapes:
             # extract a shape.mrc with marching cubes. You can view the .mrc file using ChimeraX from UCSF.
             max_batch=1000000
@@ -249,7 +250,7 @@ def generate_images(
 
             sigmas = sigmas.reshape((shape_res, shape_res, shape_res)).cpu().numpy()
             sigmas = np.flip(sigmas, 0)
-
+            import pdb; pdb.set_trace()
             # Trim the border of the extracted cube
             pad = int(30 * shape_res / 256)
             pad_value = -1000
