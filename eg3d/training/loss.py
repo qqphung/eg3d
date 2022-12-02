@@ -12,6 +12,7 @@
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import upfirdn2d
@@ -19,7 +20,7 @@ from training.dual_discriminator import filtered_resizing
 from torchvision.utils import save_image
 import os
 import cv2
-from .face_parser import FaceParser
+from .face_parser import FaceParser, Erosion2d
 #----------------------------------------------------------------------------
 
 class Loss:
@@ -57,7 +58,8 @@ class StyleGAN2Loss(Loss):
         self.blur_raw_target = True
         assert self.gpc_reg_prob is None or (0 <= self.gpc_reg_prob <= 1)
         self.step = 0
-        self.face_parser = FaceParser()
+        self.face_parser = FaceParser(device)
+        self.erosion = Erosion2d(1, 1, 7, soft_max=False).to(device)
 
     def run_G(self, z, c, swapping_prob, neural_rendering_resolution, update_emas=False):
         # import pdb; pdb.set_trace()
@@ -92,8 +94,8 @@ class StyleGAN2Loss(Loss):
         # assert False'''
         return gen_output, ws
     def smooth_seg_loss(self,depth_map, mask, img, device):
-        mask.require_grad = False
-        mask.require_grad = False
+        mask.require_grad = True
+        mask.require_grad = True
         list_kernels = []
         num_neighboors = 3
         init_neighboor = torch.zeros((num_neighboors, num_neighboors), dtype=torch.float32)
@@ -120,32 +122,24 @@ class StyleGAN2Loss(Loss):
         neighbor_loss = neighbor_loss.mean()
         return neighbor_loss
 
-    def load_cz(self, swapping_prob, device):
-        dir = 'save_test'
-        seg_dir  = '../seg_mask'
-        for i in range(1,11):
-            path_c = os.path.join(dir, 'c'+str(i)+'.pt')
-            c = torch.load(path_c)
-            path_z = os.path.join( dir, 'z'+str(i)+'.pt')
-            z = torch.load(path_z)
-            out, _ = self.run_G(z, c, swapping_prob=swapping_prob, neural_rendering_resolution=128)
+    def load_cz(self, swapping_prob, device, gen_z, gen_c):
+        
+        out, _ = self.run_G(gen_z, gen_c, swapping_prob=swapping_prob, neural_rendering_resolution=128)
 
-            # FACE PARSING
-            image = out["image"].permute(0,2,3,1).detach().cpu().numpy()[0]
-            image = (image - image.min((0, 1))) / (image.max((0, 1)) - image.min((0, 1)))
-            image = (image * 255).astype('uint8')
-            seg_mask = self.face_parser.parse(image)
-            seg_mask = cv2.resize(seg_mask, (256, 256), cv2.INTER_NEAREST)
+        # FACE PARSING
+        image = out["image"].detach()
+        seg_mask = self.face_parser.parse(image) # B x 1 x 512 x 512
 
-            seg_mask = (seg_mask == 1).astype(np.uint8)
-            kernel = np.ones((7, 7), np.uint8)
-            seg_mask = cv2.erode(seg_mask, kernel)
-            seg_mask = torch.tensor(seg_mask).unsqueeze(0).unsqueeze(0).to(device)
-            depth_map = out['image_depth']
-            
-            resize_d = cv2.resize(depth_map[0,0].cpu().detach().numpy(), (256, 256), cv2.INTER_NEAREST)
-            resize_d = torch.tensor(resize_d).unsqueeze(0).unsqueeze(0).to(device)
-            neighbor_loss = self.smooth_seg_loss(resize_d, seg_mask, out['image_raw'].to(device), device)
+        seg_mask = (seg_mask == 1).float()
+        seg_mask = F.interpolate(seg_mask, size=(256, 256), mode='nearest')
+        with torch.no_grad():
+            seg_mask = self.erosion(seg_mask)
+
+        depth_map = out['image_depth']
+        depth_map = F.interpolate(depth_map, size=(256, 256), mode='bilinear', align_corners=True)
+        neighbor_loss = self.smooth_seg_loss(depth_map, seg_mask, out['image_raw'].to(device), device)
+
+        return neighbor_loss
 
     def run_D(self, img, c, blur_sigma=0, blur_sigma_raw=0, update_emas=False):
         blur_size = np.floor(blur_sigma * 3)
@@ -207,7 +201,7 @@ class StyleGAN2Loss(Loss):
         if phase in ['Gsmooth']:
 
         # if :
-            loss = self.load_cz(swapping_prob, real_img_raw.device)
+            loss = self.load_cz(swapping_prob, real_img_raw.device, gen_z, gen_c)
             loss.mul(gain).backward()
             # gen_img, _ = self.run_G(gen_z, gen_c, swapping_prob=swapping_prob, neural_rendering_resolution=128)
             # img_r = gen_img['image']
