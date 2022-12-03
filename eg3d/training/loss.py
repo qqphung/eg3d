@@ -61,6 +61,24 @@ class StyleGAN2Loss(Loss):
         self.face_parser = FaceParser(device)
         self.erosion = Erosion2d(1, 1, 7, soft_max=False).to(device)
 
+        list_kernels = []
+        num_neighboors = 3
+        init_neighboor = torch.zeros((num_neighboors, num_neighboors), dtype=torch.float32)
+        init_neighboor[1,1] = 1
+        
+        for i in range(num_neighboors):
+            for j in range(num_neighboors):
+                if (i == 1 and j== 1) : continue
+                tmp = init_neighboor.clone()
+                tmp[i,j] = -1.
+                list_kernels.append(tmp)
+        list_kernels = torch.stack(list_kernels, 0).unsqueeze(1)
+        list_kernels.require_grad = False
+        self.diff_kernel = list_kernels.to(device)
+        
+        # diff depth
+        
+
     def run_G(self, z, c, swapping_prob, neural_rendering_resolution, update_emas=False):
         # import pdb; pdb.set_trace()
         # self.G.eval().requires_grad_(False)
@@ -70,7 +88,7 @@ class StyleGAN2Loss(Loss):
         else:
             c_gen_conditioning = torch.zeros_like(c)
         
-        c_gen_conditioning = torch.zeros_like(c)
+       
         ws = self.G.mapping(z, c_gen_conditioning, update_emas=update_emas)
         if self.style_mixing_prob > 0:
             with torch.autograd.profiler.record_function('style_mixing'):
@@ -95,31 +113,22 @@ class StyleGAN2Loss(Loss):
         return gen_output, ws
     def smooth_seg_loss(self,depth_map, mask, img, device):
         mask.require_grad = True
-        mask.require_grad = True
-        list_kernels = []
-        num_neighboors = 3
-        init_neighboor = torch.zeros((num_neighboors, num_neighboors), dtype=torch.float32)
-        init_neighboor[1,1] = 1
-        
-        for i in range(num_neighboors):
-            for j in range(num_neighboors):
-                if (i == 1 and j== 1) : continue
-                tmp = init_neighboor.clone()
-                tmp[i,j] = -1.
-                list_kernels.append(tmp)
-        list_kernels = torch.stack(list_kernels, 0).unsqueeze(1)
-        list_kernels.require_grad = False
-        list_kernels = list_kernels.to(device)
-        
-        # diff depth
-        diff_depth = torch.nn.functional.conv2d(depth_map, list_kernels, padding=(1,1) )
+        self.diff_kernel.require_grad = False
+
+        diff_depth = torch.nn.functional.conv2d(depth_map, self.diff_kernel, padding=(1,1))
+
         mask[:, :, 0] = 0
         mask[:, :, 255] = 0
         mask[:, :, :, 255] = 0
         mask[:, :, :, 0] = 0
-        neighbor_loss = mask *((diff_depth**2).sum(1)) ** 0.5
-        save_image((neighbor_loss - neighbor_loss.min()) / (neighbor_loss.max()-neighbor_loss.min()) , 'test_img/ne_test_loadmd.png')
-        neighbor_loss = neighbor_loss.mean()
+        neighbor_loss = mask * ((diff_depth**2).sum(1)) ** 0.5
+        
+        # save_image((neighbor_loss - neighbor_loss.min()) / (neighbor_loss.max()-neighbor_loss.min()) , 'test_img/ne_test_loadmd.png')
+        neighbor_loss = neighbor_loss[mask > 0]
+        valid_loss, _ = torch.topk(neighbor_loss, int(0.7 * neighbor_loss.size()[0]))
+        neighbor_loss = valid_loss.mean()
+        # import pdb; pdb.set_trace()
+        # print(neighbor_loss)
         return neighbor_loss
 
     def load_cz(self, swapping_prob, device, gen_z, gen_c):
@@ -194,7 +203,6 @@ class StyleGAN2Loss(Loss):
                 real_img_raw = upfirdn2d.filter2d(real_img_raw, f / f.sum())
 
         real_img = {'image': real_img, 'image_raw': real_img_raw}
-        gen_img, _ = self.run_G(gen_z, gen_c, swapping_prob=swapping_prob, neural_rendering_resolution=64)
 
         # Smothness loss
         # if phase == 'Greg': import pdb; pdb.set_trace()
@@ -202,67 +210,9 @@ class StyleGAN2Loss(Loss):
 
         # if :
             loss = self.load_cz(swapping_prob, real_img_raw.device, gen_z, gen_c)
+            training_stats.report('Loss/smooth', loss)
             loss.mul(gain).backward()
-            # gen_img, _ = self.run_G(gen_z, gen_c, swapping_prob=swapping_prob, neural_rendering_resolution=128)
-            # img_r = gen_img['image']
-
             
-            # img = gen_img['image_raw']
-            # depth_map = gen_img['image_depth']
-            
-            # max_depth = depth_map.max()
-            # min_depth = depth_map.min()
-            # margin = (max_depth + min_depth) / 2.05
-            # threshold = 0.3
-            # variance_c = 0.05
-            # mask = (depth_map <  margin).float()
-            # list_kernels = []
-            # num_neighboors = 3
-            # init_neighboor = torch.zeros((num_neighboors, num_neighboors), dtype=torch.float32)
-            # init_neighboor[1,1] = 1
-            # device=real_img_raw.device
-            # for i in range(num_neighboors):
-            #     for j in range(num_neighboors):
-            #         if (i == 1 and j== 1) : continue
-            #         tmp = init_neighboor.clone()
-            #         tmp[i,j] = -1.
-            #         list_kernels.append(tmp)
-            # list_kernels = torch.stack(list_kernels, 0).unsqueeze(1)
-            # list_kernels.require_grad = False
-            # list_kernels = list_kernels.to(device)
-            # # img weight
-            
-            # diff_img = torch.nn.functional.conv2d(img.view(-1, 1, img.shape[2], img.shape[3] ), list_kernels, padding=(1,1))
-            # diff_img = diff_img.view(-1, 3, 8 , img.shape[2], img.shape[3])
-            # diff_img = (diff_img **2).sum(1) 
-            # threshold_mask = (diff_img < threshold).float()
-            # wc = threshold_mask * torch.exp(-diff_img / ( 2* variance_c))
-            
-            # # diff depth
-            # diff_depth = torch.nn.functional.conv2d(depth_map, list_kernels, padding=(1,1) )
-            # neighbor_loss = wc * diff_depth
-            # mask[:, :, 0] = 0
-            # mask[:, :, 127] = 0
-            # mask[:, :, :, 127] = 0
-            # mask[:, :, :, 0] = 0
-            # neighbor_loss = mask *((neighbor_loss**2).sum(1)) ** 0.5
-            # save_image((neighbor_loss - neighbor_loss.min()) / (neighbor_loss.max()-neighbor_loss.min()) , 'test_img/ne_test_loadmd.png')
-            # neighbor_loss = neighbor_loss.mean()
-            # (neighbor_loss.mul(gain)  ).backward()
-            # import pdb; pdb.set_trace()
-            
-            # img_r= (img_r - img_r.min()) / (img_r.max() - img_r.min())
-            # save_image(img_r, 'test_img/test_loadmd.png')
-            # img = gen_img['image_raw']
-            # depth_map = gen_img['image_depth']
-            # save_image(img, 'test_img/r_test_loadmd.png')
-            # save_image((depth_map - depth_map.min()) / (depth_map.max()-depth_map.min()) , 'test_img/d_test_loadmd.png')
-            # save_image((wc[0,1] - wc[0,1].min()) / (wc[0,1].max()-wc[0,1].min()) , 'test_img/wc_test_loadmd1.png')
-            
-            # save_image((hh - hh.min()) / (hh.max()-hh.min()) , 'test_img/hh.png')
-            # save_image((kk[0,1] - kk[0,1].min()) / (kk[0,1].max()-kk[0,1].min()) , 'test_img/hh1.png')
-            # return gen_img
-
 
         # Gmain: Maximize logits for generated images.
         
