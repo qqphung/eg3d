@@ -17,7 +17,7 @@ from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import upfirdn2d
 from training.dual_discriminator import filtered_resizing
-from torchvision.utils import save_image
+# from torchvision.utils import save_image
 import os
 import cv2
 from .face_parser import FaceParser, Erosion2d
@@ -121,7 +121,8 @@ class StyleGAN2Loss(Loss):
         mask[:, :, 255] = 0
         mask[:, :, :, 255] = 0
         mask[:, :, :, 0] = 0
-        neighbor_loss = mask * ((diff_depth**2).sum(1)) ** 0.5
+        neighbor_loss = mask * ((diff_depth**2).sum(1, keepdims=True)) ** 0.5
+        # import pdb; pdb.set_trace()
         
         # save_image((neighbor_loss - neighbor_loss.min()) / (neighbor_loss.max()-neighbor_loss.min()) , 'test_img/ne_test_loadmd.png')
         neighbor_loss = neighbor_loss[mask > 0]
@@ -211,7 +212,7 @@ class StyleGAN2Loss(Loss):
         # if :
             loss = self.load_cz(swapping_prob, real_img_raw.device, gen_z, gen_c)
             training_stats.report('Loss/smooth', loss)
-            loss.mul(gain).backward()
+            loss.mul(100).backward()
             
 
         # Gmain: Maximize logits for generated images.
