@@ -17,7 +17,7 @@ from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import upfirdn2d
 from training.dual_discriminator import filtered_resizing
-from torchvision.utils import save_image
+# from torchvision.utils import save_image
 import os
 import cv2
 from .face_parser import FaceParser, Erosion2d
@@ -121,9 +121,11 @@ class StyleGAN2Loss(Loss):
         mask[:, :, 255] = 0
         mask[:, :, :, 255] = 0
         mask[:, :, :, 0] = 0
-        neighbor_loss = mask * ((diff_depth**2).sum(1)) ** 0.5
+        neighbor_loss = mask * ((diff_depth**2).sum(1, keepdims=True)) ** 0.5
+        # import pdb; pdb.set_trace()
         
-        # save_image((neighbor_loss - neighbor_loss.min()) / (neighbor_loss.max()-neighbor_loss.min()) , 'test_img/ne_test_loadmd.png')
+        # save_image((neighbor_loss - neighbor_loss.min()) / (neighbor_loss.max()-neighbor_loss.min()) , f'test_img/ne_test_loadmd{self.step}.png')
+        
         neighbor_loss = neighbor_loss[mask > 0]
         valid_loss, _ = torch.topk(neighbor_loss, int(0.7 * neighbor_loss.size()[0]))
         neighbor_loss = valid_loss.mean()
@@ -131,7 +133,7 @@ class StyleGAN2Loss(Loss):
         # print(neighbor_loss)
         return neighbor_loss
 
-    def load_cz(self, swapping_prob, device, gen_z, gen_c):
+    def load_cz(self, swapping_prob, device, gen_z, gen_c, id_class, erosion=True):
         
         out, _ = self.run_G(gen_z, gen_c, swapping_prob=swapping_prob, neural_rendering_resolution=128)
 
@@ -139,11 +141,14 @@ class StyleGAN2Loss(Loss):
         image = out["image"].detach()
         seg_mask = self.face_parser.parse(image) # B x 1 x 512 x 512
 
-        seg_mask = (seg_mask == 1).float()
+        seg_mask = (seg_mask == id_class).float()
+        if seg_mask.sum() == 0:
+            return 0
         seg_mask = F.interpolate(seg_mask, size=(256, 256), mode='nearest')
-        with torch.no_grad():
-            seg_mask = self.erosion(seg_mask)
-
+        if erosion:
+            with torch.no_grad():
+                seg_mask = self.erosion(seg_mask)
+        
         depth_map = out['image_depth']
         depth_map = F.interpolate(depth_map, size=(256, 256), mode='bilinear', align_corners=True)
         neighbor_loss = self.smooth_seg_loss(depth_map, seg_mask, out['image_raw'].to(device), device)
@@ -209,9 +214,16 @@ class StyleGAN2Loss(Loss):
         if phase in ['Gsmooth']:
 
         # if :
-            loss = self.load_cz(swapping_prob, real_img_raw.device, gen_z, gen_c)
+            id_classes = [1, 4, 5]
+            loss = 0
+            for id in id_classes:
+                if id == 1:
+                    erosion = True
+                else:
+                    erosion = False
+                loss += self.load_cz(swapping_prob, real_img_raw.device, gen_z, gen_c, id, erosion )
             training_stats.report('Loss/smooth', loss)
-            loss.mul(gain).backward()
+            loss.mul(100).backward()
             
 
         # Gmain: Maximize logits for generated images.
