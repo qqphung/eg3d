@@ -17,7 +17,7 @@ from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import upfirdn2d
 from training.dual_discriminator import filtered_resizing
-# # from torchvision.utils import save_image
+from torchvision.utils import save_image
 import os
 import cv2
 from .face_parser import FaceParser, Erosion2d
@@ -59,8 +59,8 @@ class StyleGAN2Loss(Loss):
         assert self.gpc_reg_prob is None or (0 <= self.gpc_reg_prob <= 1)
         self.step = 0
         self.face_parser = FaceParser(device)
-        self.erosion = Erosion2d(1, 1, 7, soft_max=False).to(device)
-
+        # self.erosion = Erosion2d(1, 1, 7, soft_max=False).to(device)
+        self.erosion = [Erosion2d(1, 1, 7, soft_max=False).to(device),Erosion2d(1, 1, 3, soft_max=False).to(device),  Erosion2d(1, 1, 3, soft_max=False).to(device), Erosion2d(1, 1, 3, soft_max=False).to(device), Erosion2d(1, 1, 3, soft_max=False).to(device)]
         list_kernels = []
         num_neighboors = 3
         init_neighboor = torch.zeros((num_neighboors, num_neighboors), dtype=torch.float32)
@@ -124,35 +124,40 @@ class StyleGAN2Loss(Loss):
         neighbor_loss = mask * ((diff_depth**2).sum(1, keepdims=True)) ** 0.5
         # import pdb; pdb.set_trace()
         
-        # save_image((neighbor_loss - neighbor_loss.min()) / (neighbor_loss.max()-neighbor_loss.min()) , f'test_img/ne_test_loadmd{self.step}.png')
-        
+        # save_image((neighbor_loss - neighbor_loss.min()) / (neighbor_loss.max()-neighbor_loss.min()) , f'test_img/save_3/ne_test_loadmd{self.step}.png')
+        self.step += 1
+        # assert False
         neighbor_loss = neighbor_loss[mask > 0]
         valid_loss, _ = torch.topk(neighbor_loss, int(0.7 * neighbor_loss.size()[0]))
         neighbor_loss = valid_loss.mean()
-        # import pdb; pdb.set_trace()
-        # print(neighbor_loss)
+        
         return neighbor_loss
 
-    def load_cz(self, swapping_prob, device, gen_z, gen_c, id_class, erosion=True):
+    def load_cz(self, swapping_prob, device, gen_z, gen_c, id_class):
         
         out, _ = self.run_G(gen_z, gen_c, swapping_prob=swapping_prob, neural_rendering_resolution=128)
 
         # FACE PARSING
         image = out["image"].detach()
+        # save_image(image, 'test_img/img.png')
         seg_mask = self.face_parser.parse(image) # B x 1 x 512 x 512
-
-        seg_mask = (seg_mask == id_class).float()
-        if seg_mask.sum() == 0:
-            return 0
-        seg_mask = F.interpolate(seg_mask, size=(256, 256), mode='nearest')
-        if erosion:
+        
+        all_mask = torch.zeros((image.shape[0], 1, 256, 256)).to(device)
+        for i, id in enumerate(id_class):
+            one_mask = (seg_mask == id).float()
+            
+            one_mask = F.interpolate(one_mask, size=(256, 256), mode='nearest')
+            # import pdb; pdb.set_trace()
             with torch.no_grad():
-                seg_mask = self.erosion(seg_mask)
+                one_mask = self.erosion[i](one_mask)
+            all_mask += one_mask
+        
+        
         
         depth_map = out['image_depth']
         depth_map = F.interpolate(depth_map, size=(256, 256), mode='bilinear', align_corners=True)
-        neighbor_loss = self.smooth_seg_loss(depth_map, seg_mask, out['image_raw'].to(device), device)
-
+        neighbor_loss = self.smooth_seg_loss(depth_map, all_mask, out['image_raw'].to(device), device)
+        # print(neighbor_loss)
         return neighbor_loss
 
     def run_D(self, img, c, blur_sigma=0, blur_sigma_raw=0, update_emas=False):
@@ -214,14 +219,10 @@ class StyleGAN2Loss(Loss):
         if phase in ['Gsmooth']:
 
         # if :
-            id_classes = [1, 4, 5]
+            id_classes = [1, 4, 5, 12, 13]
             loss = 0
-            for id in id_classes:
-                if id == 1:
-                    erosion = True
-                else:
-                    erosion = False
-                loss += self.load_cz(swapping_prob, real_img_raw.device, gen_z, gen_c, id, erosion )
+            
+            loss = self.load_cz(swapping_prob, real_img_raw.device, gen_z, gen_c, id_classes )
             training_stats.report('Loss/smooth', loss)
             loss.mul(100).backward()
             
