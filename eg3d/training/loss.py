@@ -13,6 +13,7 @@
 import numpy as np
 import torch
 from torch.nn import functional as F
+from training.gaussian import generate_gaussian_map
 from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import upfirdn2d
@@ -20,7 +21,7 @@ from training.dual_discriminator import filtered_resizing
 # from torchvision.utils import save_image
 import os
 import cv2
-from .face_parser import FaceParser, Erosion2d
+from .face_parser import FaceParser, Erosion2d, Dilation2d
 #----------------------------------------------------------------------------
 
 class Loss:
@@ -58,13 +59,11 @@ class StyleGAN2Loss(Loss):
         self.blur_raw_target = True
         assert self.gpc_reg_prob is None or (0 <= self.gpc_reg_prob <= 1)
         self.step = 0
+        
         self.face_parser = FaceParser(device)
-        # self.erosion = Erosion2d(1, 1, 7, soft_max=False).to(device)
-        kernels = [7, 3, 3, 3 ,3]
-        self.weights = [1.0, 0.1, 0.1, 0.1, 0.1]
-        self.erosion = []
-        for kernel in kernels:
-            self.erosion.append(Erosion2d(1, 1, kernel, soft_max=False).to(device))
+        self.erosion = Erosion2d(1, 1, 7, soft_max=False).to(device)
+        self.eye_erosion = Erosion2d(1, 1, 3, soft_max=False).to(device)
+        self.dilation = Dilation2d(1, 1, 7, soft_max=False).to(device)
             
         list_kernels = []
         num_neighboors = 3
@@ -135,9 +134,28 @@ class StyleGAN2Loss(Loss):
             return 0
         return neighbor_loss
 
-    def load_cz(self, swapping_prob, device, gen_z, gen_c, id_class):
+    def compute_angle_from_matrix(self, matrix3x3):
+        M = matrix3x3
+        theta_y = torch.asin(-M[:, 2, 0])
+        theta_z = torch.atan2(M[:, 1, 0], M[:, 0, 0])
+        theta_x = torch.atan2(M[:, 2, 1], M[:, 2, 2])
+        return (theta_x, theta_y, theta_z)
+
+    def compute_angle_from_c(self, gen_c):
+        
+        extrinsic = gen_c[:, :16].detach()
+        extrinsic = extrinsic.reshape((-1, 4, 4))
+        angle = self.compute_angle_from_matrix(extrinsic[:, :3, :3])
+        
+        return angle
+
+    def load_cz(self, swapping_prob, device, gen_z, gen_c):
         
         out, _ = self.run_G(gen_z, gen_c, swapping_prob=swapping_prob, neural_rendering_resolution=128)
+        angles = self.compute_angle_from_c(gen_c)
+
+        frontal_ids = angles[1].abs() < (np.pi/ 12)
+        
         
         # Compute depth diff
         depth_map = out['image_depth']
@@ -148,21 +166,168 @@ class StyleGAN2Loss(Loss):
         image = out["image"].detach()
         seg_mask = self.face_parser.parse(image) # B x 1 x 512 x 512
         neighbor_loss = 0
-        for i, id in enumerate(id_class):
-            one_mask = (seg_mask == id).float()
-            
-            one_mask = F.interpolate(one_mask, size=(256, 256), mode='nearest')
-            # import pdb; pdb.set_trace()
-            with torch.no_grad():
-                one_mask = self.erosion[i](one_mask)
-            self.diff_kernel.require_grad = False
 
-            topk = 1.0
-            if id == 1:
-                topk = 0.7
-            neighbor_loss += self.weights[i] * self.smooth_seg_loss(diff_depth, one_mask, topk)
+        # For skin
+        skin_mask = (seg_mask == 1).float()
             
-        # print(neighbor_loss)
+        skin_mask = F.interpolate(skin_mask, size=(256, 256), mode='nearest')
+        with torch.no_grad():
+            skin_mask = self.erosion(skin_mask)
+        skin_loss = 1.0 * self.smooth_seg_loss(diff_depth, skin_mask, 0.7)
+
+        eye_mask = ((seg_mask == 4) | (seg_mask == 5)).float()
+        eye_mask = F.interpolate(eye_mask, size=(256, 256), mode='nearest')
+        with torch.no_grad():
+            eye_mask = self.eye_erosion(eye_mask)
+        eye_mask[~frontal_ids] = 0.0
+        eye_loss = 1.0 * self.smooth_seg_loss(diff_depth, eye_mask, 1.0)
+        # print(skin_loss, eye_loss)
+        neighbor_loss = skin_loss + eye_loss
+        return neighbor_loss
+
+        # For eye
+        eye_loss = 0
+        high_res_depth = F.interpolate(depth_map, size=(512, 512), mode='bilinear', align_corners=True)
+
+        # TODO: Debug
+        # high_res_image = F.interpolate(image, size=(512, 512), mode='bilinear', align_corners=True)
+        # min_img = high_res_image.flatten(2).min(2)[0][:, :, None, None]
+        # max_img = high_res_image.flatten(2).max(2)[0][:, :, None, None]
+        # high_res_image = (high_res_image - min_img) / (max_img - min_img)
+        # high_res_image = high_res_image.permute(0, 2, 3, 1)
+        # eye_mask = (seg_mask == 4) | (seg_mask == 5)
+        # for mask, image, depth in zip(eye_mask, high_res_image, high_res_depth):
+        #     image = image.cpu().numpy()[:, :, ::-1] * 255
+        #     image = image.astype('uint8')
+
+        #     mask = mask[0, :, :, None].cpu().numpy()
+        #     eye_mask_color = np.zeros_like(image)
+        #     eye_mask_color[:, :, 0] = mask[:, :, 0] * 255
+        #     eye_mask_color[:, :, 2] = mask[:, :, 0] * 255
+            
+        #     image = image * (1 - mask) + mask * (image * 0.7 + 0.3 * eye_mask_color)
+        #     cv2.imwrite("image.png", image)
+        #     depth = depth[0].cpu().detach().numpy()
+        #     depth = 1.0 - (depth - depth.min()) / (depth.max() - depth.min())
+        #     depth[depth < 0.5] = 0.5
+        #     depth = (depth - depth.min()) / (depth.max() - depth.min())
+        #     depth = (depth * 255).astype('uint8')
+        #     depth = cv2.applyColorMap(depth, cv2.COLORMAP_JET)
+        #     cv2.imwrite("depth.png", depth)
+        #     import pdb; pdb.set_trace()
+
+        for eye_id in [4, 5]:
+            eye_mask = (seg_mask == eye_id).float()
+
+            # Dilation to get surrounding mask
+            with torch.no_grad():
+                surround_eye_mask = self.dilation(eye_mask)
+
+            valid_indices = (eye_mask.sum((1,2,3)) > 3) & frontal_ids
+            
+            if valid_indices.sum() == 0:
+                continue    
+            eye_depth = high_res_depth[valid_indices].float()
+            eye_mask = eye_mask[valid_indices].float()
+
+            # Find the eye center & radius
+            coords = torch.nonzero(eye_mask[:, 0])
+            
+
+            centers = []
+            radius = []
+            min_depth = []
+            max_depth = []
+            keep_indices = []
+            for batch_i in range(eye_depth.shape[0]):
+                b_coords = coords[coords[:, 0] == batch_i][:, 1:].cpu().numpy()
+                b_depth = eye_depth[batch_i][eye_mask[batch_i] > 0]
+                max_depth.append(b_depth.max().item())
+                min_depth.append(b_depth.min().item())
+
+                y1, y2, x1, x2 = b_coords[:, 0].min(), b_coords[:, 0].max(), b_coords[:, 1].min(), b_coords[:, 1].max()
+                center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                
+                if eye_mask[batch_i, 0, center[1], center[0]] > 0:
+                    keep_indices.append(True)
+                else:
+                    keep_indices.append(False)
+                
+                centers.append(center)
+                radius.append(max(x2 - x1 + 1, y2 - y1 + 1))
+
+            min_depth = torch.tensor(min_depth, device=depth_map.device)[:, None, None, None]
+            max_depth = torch.tensor(max_depth, device=depth_map.device)[:, None, None, None]
+
+            # Compute gaussian map
+            gaussian_map = 1.0 - generate_gaussian_map(centers, radius, size=(512, 512))
+            gaussian_map = torch.from_numpy(gaussian_map).to(depth_map.device)
+
+            # Scale to depth max and min value
+            gaussian_map = gaussian_map * (max_depth - min_depth) + min_depth
+            # import pdb; pdb.set_trace()
+            gaussian_map = gaussian_map * eye_mask
+
+            # import pdb; pdb.set_trace()
+            # for batch_i in range(eye_depth.shape[0]):
+            #     vis_gt = gaussian_map[batch_i,0].cpu().numpy()
+            #     vis_gt[vis_gt > 0] = 0.5 + (vis_gt[vis_gt > 0] - vis_gt[vis_gt > 0].min()) / (2 * (vis_gt[vis_gt > 0].max() - vis_gt[vis_gt > 0].min()))
+
+            #     vis_pred = (eye_depth * eye_mask)[batch_i, 0].detach().cpu().numpy()
+            #     vis_pred[vis_pred > 0] = 0.5 + (vis_pred[vis_pred > 0] - vis_pred[vis_pred > 0].min()) / (2 * (vis_pred[vis_pred > 0].max() - vis_pred[vis_pred > 0].min()))
+                
+            #     vis_depth = eye_depth[batch_i, 0].detach().cpu().numpy()
+            #     vis_depth = (vis_depth - vis_depth.min()) / ((vis_depth.max() - vis_depth.min()))
+            #     vis_depth = 1.0 - vis_depth
+
+            #     cv2.imwrite(f"eye_{batch_i}.png", vis_gt * 255)
+            #     cv2.imwrite(f"eye_out{batch_i}.png", vis_pred * 255)
+            #     cv2.imwrite(f"depth_{batch_i}.png", vis_depth * 255)
+                # import pdb; pdb.set_trace()
+
+            # Contraint eyes to globe shaped
+            one_eye_loss = torch.sqrt(F.mse_loss(gaussian_map, eye_depth, reduction='none')[keep_indices][eye_mask[keep_indices] > 0]).mean()
+
+            # Constraint eyes to not higher than surrounding region
+            surround_eye_mask = surround_eye_mask[valid_indices]
+            surround_eye_mask[eye_mask > 0] = 0
+            surround_eye_depth = surround_eye_mask * eye_depth
+            # surround_eye_depth[surround_eye_mask == 0] = 999
+            max_constraint_value = surround_eye_depth.flatten(1).max(1)[0].detach()
+            
+            max_constraint_value = max_constraint_value[:, None, None, None] * torch.ones_like(gaussian_map)
+
+            error_ids = (gaussian_map < max_constraint_value) & (eye_mask > 0)
+            # cv2.imwrite("error.png", error_ids[0,0].cpu().numpy() * 255)
+            eye_upper_bound = 0
+            if torch.any(error_ids):
+                eye_upper_bound = torch.sqrt(F.mse_loss(gaussian_map[error_ids], max_constraint_value[error_ids], reduction='none')).mean()
+            # print(eye_upper_bound)
+            # import pdb; pdb.set_trace()
+            # Constraint eyes to not higher than any skin region
+            # skin_mask = (seg_mask == 1).float()[valid_indices]
+            # with torch.no_grad():
+            #     skin_mask = self.erosion(skin_mask)
+            # skin_depth = skin_mask * eye_depth
+            # skin_depth[skin_mask == 0] = 9999
+            # max_constraint_value = skin_depth.flatten(1).min(1)[0].detach()
+            
+            # max_constraint_value = max_constraint_value[:, None, None, None] * torch.ones_like(gaussian_map)
+
+            # error_ids = (gaussian_map < max_constraint_value) & (eye_mask > 0)
+            # cv2.imwrite("error.png", error_ids[2,0].cpu().numpy() * 255)
+            # eye_upper_bound2 = 0
+            # if torch.any(error_ids):
+            #     eye_upper_bound2 = torch.sqrt(F.mse_loss(gaussian_map[error_ids], max_constraint_value[error_ids], reduction='none')).mean()
+
+            # print(eye_upper_bound, eye_upper_bound2)
+            # import pdb; pdb.set_trace()
+            
+            if not torch.isnan(one_eye_loss):
+                eye_loss = eye_loss + one_eye_loss + eye_upper_bound #+ eye_upper_bound2
+
+            # print(eye_loss)
+        neighbor_loss = skin_loss + 0.3 * eye_loss
         return neighbor_loss
 
     def run_D(self, img, c, blur_sigma=0, blur_sigma_raw=0, update_emas=False):
@@ -224,10 +389,9 @@ class StyleGAN2Loss(Loss):
         if phase in ['Gsmooth']:
 
         # if :
-            id_classes = [1, 4, 5, 12, 13]
             loss = 0
             
-            loss = self.load_cz(swapping_prob, real_img_raw.device, gen_z, gen_c, id_classes )
+            loss = self.load_cz(swapping_prob, real_img_raw.device, gen_z, gen_c)
             training_stats.report('Loss/smooth', loss)
             loss.mul(100).backward()
             
